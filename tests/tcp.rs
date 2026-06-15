@@ -581,7 +581,11 @@ fn connect_error() {
         .register(&mut listener, Token(1), Interest::READABLE)
         .unwrap();
     poll.registry()
-        .register(&mut stream, Token(0), Interest::READABLE | Interest::WRITABLE)
+        .register(
+            &mut stream,
+            Token(0),
+            Interest::READABLE | Interest::WRITABLE,
+        )
         .unwrap();
 
     // Accept the connection, then reset it from the server side.
