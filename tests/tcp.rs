@@ -562,42 +562,60 @@ fn connection_reset_by_peer() {
     }
 }
 
+// `set_linger_zero` relies on `SO_LINGER`, which isn't available on WASI.
+#[cfg(not(target_os = "wasi"))]
 #[test]
 fn connect_error() {
     let (mut poll, mut events) = init_with_poll();
 
-    // Pick a "random" port that shouldn't be in use.
-    let mut stream = match TcpStream::connect("127.0.0.1:58381".parse().unwrap()) {
-        Ok(l) => l,
-        Err(ref e) if e.kind() == io::ErrorKind::ConnectionRefused => {
-            // Connection failed synchronously.  This is not a bug, but it
-            // unfortunately doesn't get us the code coverage we want.
-            return;
-        }
-        Err(e) => panic!("TcpStream::connect unexpected error {e:?}"),
-    };
+    // Produce a deterministic connection error: connect to a real listener,
+    // then reset the connection from the server side (`set_linger_zero` makes
+    // `close` send a RST). This avoids connecting to a "random" unused port,
+    // whose behaviour depends on the environment and could leave `poll` blocked
+    // indefinitely. See <https://github.com/tokio-rs/mio/issues/959>.
+    let mut listener = TcpListener::bind("127.0.0.1:0".parse().unwrap()).unwrap();
+    let addr = listener.local_addr().unwrap();
+    let mut stream = TcpStream::connect(addr).unwrap();
 
     poll.registry()
-        .register(&mut stream, Token(0), Interest::WRITABLE)
+        .register(&mut listener, Token(1), Interest::READABLE)
+        .unwrap();
+    poll.registry()
+        .register(&mut stream, Token(0), Interest::READABLE | Interest::WRITABLE)
         .unwrap();
 
-    'outer: loop {
+    // Accept the connection, then reset it from the server side.
+    let server = 'accept: loop {
         poll.poll(&mut events, None).unwrap();
-
         for event in &events {
-            if event.token() == Token(0) {
-                // With fastopen we would be able to write
-                // Without fastopen we would be getting the connection error
-                assert!(event.is_writable() || event.is_error());
-                // Solaris poll(2) says POLLHUP and POLLOUT are mutually exclusive.
-                #[cfg(not(any(target_os = "solaris", target_os = "cygwin", target_os = "wasi")))]
-                assert!(event.is_write_closed());
+            if event.token() == Token(1) {
+                if let Ok((server, _)) = listener.accept() {
+                    break 'accept server;
+                }
+            }
+        }
+    };
+    set_linger_zero(&server);
+    drop(server);
+
+    // The reset surfaces as readiness on the stream plus a pending socket error.
+    // A plain writable event (the connection completing) can arrive first, so we
+    // poll until the error is actually set, bounded so a missing event fails the
+    // test rather than hanging it.
+    let start = std::time::Instant::now();
+    'outer: loop {
+        assert!(
+            start.elapsed() < Duration::from_secs(5),
+            "connection error did not surface"
+        );
+        poll.poll(&mut events, Some(Duration::from_millis(100)))
+            .unwrap();
+        for event in &events {
+            if event.token() == Token(0) && stream.take_error().unwrap().is_some() {
                 break 'outer;
             }
         }
     }
-
-    assert!(stream.take_error().unwrap().is_some());
 }
 
 #[cfg_attr(
