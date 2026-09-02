@@ -346,6 +346,9 @@ struct Io {
     cp: Option<Arc<CompletionPort>>,
     // Token used to identify events
     token: Option<Token>,
+    // Interests the pipe is registered with, used to filter the readiness
+    // notifications below.
+    interests: Option<Interest>,
     read: State,
     write: State,
     connect_error: Option<io::Error>,
@@ -503,6 +506,7 @@ impl FromRawHandle for NamedPipe {
                 io: Mutex::new(Io {
                     cp: None,
                     token: None,
+                    interests: None,
                     read: State::None,
                     write: State::None,
                     connect_error: None,
@@ -619,7 +623,12 @@ impl<'a> Write for &'a NamedPipe {
 }
 
 impl Source for NamedPipe {
-    fn register(&mut self, registry: &Registry, token: Token, _: Interest) -> io::Result<()> {
+    fn register(
+        &mut self,
+        registry: &Registry,
+        token: Token,
+        interests: Interest,
+    ) -> io::Result<()> {
         let mut io = self.inner.io.lock().unwrap();
 
         io.check_association(registry, false)?;
@@ -641,6 +650,7 @@ impl Source for NamedPipe {
         }
 
         io.token = Some(token);
+        io.interests = Some(interests);
         drop(io);
 
         Inner::post_register(&self.inner, None);
@@ -648,12 +658,18 @@ impl Source for NamedPipe {
         Ok(())
     }
 
-    fn reregister(&mut self, registry: &Registry, token: Token, _: Interest) -> io::Result<()> {
+    fn reregister(
+        &mut self,
+        registry: &Registry,
+        token: Token,
+        interests: Interest,
+    ) -> io::Result<()> {
         let mut io = self.inner.io.lock().unwrap();
 
         io.check_association(registry, true)?;
 
         io.token = Some(token);
+        io.interests = Some(interests);
         drop(io);
 
         Inner::post_register(&self.inner, None);
@@ -674,6 +690,7 @@ impl Source for NamedPipe {
         }
 
         io.token = None;
+        io.interests = None;
         Ok(())
     }
 }
@@ -835,6 +852,15 @@ impl Inner {
         let mut io = me.io.lock().unwrap();
         #[allow(clippy::needless_option_as_deref)]
         if Inner::schedule_read(me, &mut io, events.as_deref_mut()) {
+            // A read that completed while the pipe had no readable interest
+            // left its result buffered without notifying anyone. Deliver it
+            // now, in case this registration does want it, otherwise the data
+            // would sit unread with no further event to announce it.
+            if matches!(io.read, State::Ok(..) | State::Err(..)) {
+                #[allow(clippy::needless_option_as_deref)]
+                io.notify_readable(me, events.as_deref_mut());
+            }
+
             if let State::None = io.write {
                 io.notify_writable(me, events);
             }
@@ -1032,6 +1058,12 @@ impl Io {
     }
 
     fn notify_readable(&self, me: &Arc<Inner>, events: Option<&mut Vec<Event>>) {
+        // Don't deliver readiness for a direction the user never registered
+        // interest in, see #1855.
+        if !matches!(self.interests, Some(interests) if interests.is_readable()) {
+            return;
+        }
+
         if let Some(token) = self.token {
             let mut ev = Event::new(token);
             ev.set_readable();
@@ -1045,6 +1077,12 @@ impl Io {
     }
 
     fn notify_writable(&self, me: &Arc<Inner>, events: Option<&mut Vec<Event>>) {
+        // Don't deliver readiness for a direction the user never registered
+        // interest in, see #1855.
+        if !matches!(self.interests, Some(interests) if interests.is_writable()) {
+            return;
+        }
+
         if let Some(token) = self.token {
             let mut ev = Event::new(token);
             ev.set_writable();

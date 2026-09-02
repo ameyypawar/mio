@@ -75,6 +75,43 @@ fn writable_after_register() {
         .any(|e| { e.token() == Token(1) && e.is_writable() }));
 }
 
+/// Registering only for readable interest must not produce a writable event,
+/// see #1855.
+#[test]
+fn readable_interest_does_not_produce_writable_event() {
+    let (mut server, mut client) = pipe();
+    let mut poll = t!(Poll::new());
+    t!(poll
+        .registry()
+        .register(&mut server, Token(0), Interest::READABLE));
+    t!(poll.registry().register(
+        &mut client,
+        Token(1),
+        Interest::READABLE | Interest::WRITABLE,
+    ));
+
+    let mut events = Events::with_capacity(128);
+    t!(poll.poll(&mut events, Some(Duration::from_millis(100))));
+    assert!(
+        !events
+            .iter()
+            .any(|e| e.token() == Token(0) && e.is_writable()),
+        "server registered readable only, but received a writable event",
+    );
+
+    // Readable interest must still be armed.
+    assert_eq!(t!(client.write(b"1234")), 4);
+    expect_events(
+        &mut poll,
+        &mut events,
+        vec![ExpectEvent::new(Token(0), Interest::READABLE)],
+    );
+
+    let mut buf = [0; 10];
+    assert_eq!(t!(server.read(&mut buf)), 4);
+    assert_eq!(&buf[..4], b"1234");
+}
+
 #[test]
 fn write_then_read() {
     let (mut server, mut client) = pipe();
