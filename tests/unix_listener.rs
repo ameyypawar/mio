@@ -119,6 +119,46 @@ fn unix_listener_reregister() {
 }
 
 #[test]
+fn unix_listener_reregisters_after_would_block() {
+    let (mut poll, mut events) = init_with_poll();
+    let path = temp_file("unix_listener_reregisters_after_would_block");
+    let mut listener = UnixListener::bind(&path).unwrap();
+    poll.registry()
+        .register(&mut listener, TOKEN_1, Interest::READABLE)
+        .unwrap();
+
+    let barrier = Arc::new(Barrier::new(2));
+    let handle = thread::spawn({
+        let barrier = barrier.clone();
+        move || {
+            let first = net::UnixStream::connect(&path).unwrap();
+            barrier.wait();
+            barrier.wait();
+            let second = net::UnixStream::connect(&path).unwrap();
+            drop((first, second));
+        }
+    });
+
+    expect_events(
+        &mut poll,
+        &mut events,
+        vec![ExpectEvent::new(TOKEN_1, Interest::READABLE)],
+    );
+    listener.accept().unwrap();
+    barrier.wait();
+    assert_would_block(listener.accept());
+
+    barrier.wait();
+    expect_events(
+        &mut poll,
+        &mut events,
+        vec![ExpectEvent::new(TOKEN_1, Interest::READABLE)],
+    );
+    listener.accept().unwrap();
+    handle.join().unwrap();
+}
+
+#[test]
 fn unix_listener_deregister() {
     let (mut poll, mut events) = init_with_poll();
     let barrier = Arc::new(Barrier::new(2));
